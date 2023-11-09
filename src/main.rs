@@ -95,8 +95,8 @@ async fn tcp_server(port: Port, sessions: Sessions) {
 }
 
 async fn tcp_connection_handler(mut socket: TcpStream, sessions: Sessions) {
-    let session_id = StringGenerator::default().next_id();
-    let session_endpoint = StringGenerator::default().next_id();
+    let session_id = StringGenerator.next_id();
+    let session_endpoint = StringGenerator.next_id();
 
     println!("[TCP] New connection {}: /{}", session_id, session_endpoint);
     socket // write request to the agent socket
@@ -162,9 +162,9 @@ async fn tcp_connection_handler(mut socket: TcpStream, sessions: Sessions) {
                         };
 
                         // Packet fragmentation?
-                        if packet_request_id != "".to_string() {
+                        if packet_request_id != *"" {
                             packet_acc_data = format!("{}{}", packet_acc_data, cur_packet_data);
-                            packet_acc_size = packet_acc_size + cur_packet_data.as_bytes().len();
+                            packet_acc_size += cur_packet_data.as_bytes().len();
 
                             if packet_acc_size == packet_total_size {
                                 println!("[TCP] Data on: {}", session_id);
@@ -251,7 +251,7 @@ async fn http_connection_handler(
 ) -> Result<Response<Body>, hyper::Error> {
     let (session_endpoint, agent_request_path) = get_request_url(&_req);
     let uri = _req.uri().clone();
-    let request_path = uri.path().clone();
+    let request_path = uri.path();
     println!("[HTTP] {}", request_path);
 
     // avoid websocket
@@ -265,7 +265,7 @@ async fn http_connection_handler(
         return Ok(response);
     }
 
-    if request_path.to_string().clone() == "/".to_string() {
+    if request_path.to_string().clone() == *"/" {
         let response = Response::builder()
             .status(200)
             .header("Content-type", "text/html")
@@ -287,7 +287,7 @@ async fn http_connection_handler(
 
     // Create raw http from request
     // ----------------------------
-    let request_id = StringGenerator::default().next_id();
+    let request_id = StringGenerator.next_id();
     // headers
     let http_request_info = format!(
         "{} {} {:?}\n",
@@ -308,7 +308,7 @@ async fn http_connection_handler(
     let body = hyper::body::to_bytes(_req.into_body()).await;
     if body.is_ok() {
         let body = body.unwrap();
-        if body.len() > 0 {
+        if !body.is_empty() {
             request += &format!("\n{}", String::from_utf8(body.to_vec()).unwrap());
         }
     }
@@ -374,7 +374,7 @@ async fn http_connection_handler(
     }
 
     // Check integrity of response [Packet fragmentation error]
-    if http_raw_response == "EPACKFRAG".to_string() {
+    if http_raw_response == *"EPACKFRAG" {
         println!("[HTTP] 500 Status on {}", session_endpoint);
         let response = Response::builder()
             .status(500)
@@ -463,15 +463,15 @@ async fn http_connection_handler(
     }
 
     println!("[HTTP] 200 Status on {}", request_path);
-    return Ok(response);
+    Ok(response)
 }
 
 fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
     let referer = _req.headers().get("referer");
 
     // [no referer]
-    if !referer.is_some() {
-        let mut segments = _req.uri().path().split("/").collect::<Vec<&str>>(); // /abc/paco -> ["", "abc", "paco"]
+    if referer.is_none() {
+        let mut segments = _req.uri().path().split('/').collect::<Vec<&str>>(); // /abc/paco -> ["", "abc", "paco"]
         let session_endpoint = segments[1].to_string();
         segments.drain(0..2); // request path
         return (session_endpoint, "/".to_string() + &segments.join("/"));
@@ -479,7 +479,7 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
 
     let referer = referer.unwrap().to_str().unwrap(); // https://localhost:8080/abc/paco
     let mut referer = referer
-        .split("/")
+        .split('/')
         .map(|r| r.to_string())
         .collect::<Vec<String>>();
     referer.drain(0..3); // drop -> "https:" + "" + "localhost:8080"
@@ -487,9 +487,9 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
     let mut url = _req
         .uri()
         .path()
-        .split("/")
+        .split('/')
         .map(|r| r.to_string())
-        .filter(|r| r != "")
+        .filter(|r| !r.is_empty())
         .collect::<Vec<String>>();
 
     // [different session-endpoint]
@@ -499,11 +499,11 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
 
     // [same session-endpoint]
     url.drain(0..1);
-    return (referer[0].clone(), "/".to_string() + &url.join("/"));
+    (referer[0].clone(), "/".to_string() + &url.join("/"))
 }
 
 fn capitilize(string: &str) -> String {
-    let segments = string.split("-");
+    let segments = string.split('-');
     let mut result: Vec<String> = Vec::new();
 
     for segment in segments {
