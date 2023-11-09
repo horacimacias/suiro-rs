@@ -14,19 +14,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use unique_id::{string::StringGenerator, Generator};
 
-struct Port {
-    num: u16,
-}
-
-impl Port {
-    fn new(port: u16) -> Self {
-        if port < 1024 {
-            println!("Port number must be greater than 1024 or run as root");
-        }
-        Port { num: port }
-    }
-}
-
 #[derive(Debug)]
 struct Session {
     socket_tx: mpsc::Sender<String>,
@@ -56,13 +43,12 @@ async fn main() {
     })
     .expect("[SUIRO](ERROR) setting Ctrl-C handler");
 
-    let http_port = Port::new(8080);
-    let tcp_port = Port::new(3040);
+    let http_port = 8080;
+    let tcp_port = 3040;
 
-    let mutex: Mutex<HashMap<String, Session>> = Mutex::new(HashMap::new());
-    let sessions = Arc::new(mutex);
+    let sessions = Sessions::default();
 
-    let sessions_tcp = Arc::clone(&sessions);
+    let sessions_tcp = sessions.clone();
     let tcp = async move {
         tcp_server(tcp_port, sessions_tcp).await;
     };
@@ -74,9 +60,9 @@ async fn main() {
     futures::join!(tcp, http);
 }
 
-async fn tcp_server(port: Port, sessions: Sessions) {
-    let listener = TcpListener::bind(("0.0.0.0", port.num)).await.unwrap();
-    println!("[TCP] Waiting connections on {}", port.num);
+async fn tcp_server(port: u16, sessions: Sessions) {
+    let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+    println!("[TCP] Waiting connections on {port}");
 
     loop {
         let (socket, _) = match listener.accept().await {
@@ -98,9 +84,9 @@ async fn tcp_connection_handler(mut socket: TcpStream, sessions: Sessions) {
     let session_id = StringGenerator.next_id();
     let session_endpoint = StringGenerator.next_id();
 
-    println!("[TCP] New connection {}: /{}", session_id, session_endpoint);
+    println!("[TCP] New connection {session_id}: /{session_endpoint}");
     socket // write request to the agent socket
-        .write_all(format!("connection\n{}", session_endpoint).as_bytes())
+        .write_all(format!("connection\n{session_endpoint}").as_bytes())
         .await
         .unwrap(); // handle unwrap...
 
@@ -122,109 +108,98 @@ async fn tcp_connection_handler(mut socket: TcpStream, sessions: Sessions) {
     let mut buffer = [0; 31250]; // 32 Kb
     loop {
         // Write data to socket on request
-        if let Some(request) = rx.recv().now_or_never() {
-            match request {
-                Some(request) => {
-                    socket.write(request.as_bytes()).await.unwrap();
-                }
-                None => {}
-            }
+        if let Some(Some(request)) = rx.recv().now_or_never() {
+            socket.write_all(request.as_bytes()).await.unwrap();
         }
 
-        match socket.read(&mut buffer).now_or_never() {
-            Some(sock) => {
-                match sock {
-                    Ok(0) => {
-                        // connection closed
-                        println!("[TCP] Connection closed: {}", session_id);
-                        break;
-                    }
-                    Ok(n) => {
-                        // data received
-                        let data = &buffer[..n];
+        if let Some(sock) = socket.read(&mut buffer).now_or_never() {
+            match sock {
+                Ok(0) => {
+                    // connection closed
+                    println!("[TCP] Connection closed: {session_id}");
+                    break;
+                }
+                Ok(n) => {
+                    // data received
+                    let data = &buffer[..n];
 
-                        // check packet integrity
-                        let cur_packet_data = String::from_utf8(data.to_vec());
-                        let cur_packet_data = match cur_packet_data {
-                            Ok(cur_packet_data) => cur_packet_data,
-                            Err(_) => {
-                                eprintln!("[TCP] EPACKGRAG: Not valid utf8");
-                                // Add data to responses hashmap
-                                let _ = tx.send((packet_request_id, "EPACKFRAG".to_string())).await;
+                    // check packet integrity
+                    let cur_packet_data = String::from_utf8(data.to_vec());
+                    let cur_packet_data = match cur_packet_data {
+                        Ok(cur_packet_data) => cur_packet_data,
+                        Err(_) => {
+                            eprintln!("[TCP] EPACKGRAG: Not valid utf8");
+                            // Add data to responses hashmap
+                            let _ = tx.send((packet_request_id, "EPACKFRAG".to_string())).await;
 
-                                packet_acc_size = 0;
-                                packet_total_size = 0;
-                                packet_acc_data = "".to_string();
-                                packet_request_id = "".to_string();
+                            packet_acc_size = 0;
+                            packet_total_size = 0;
+                            packet_acc_data = "".to_string();
+                            packet_request_id = "".to_string();
 
-                                continue;
-                            }
-                        };
-
-                        // Packet fragmentation?
-                        if packet_request_id != *"" {
-                            packet_acc_data = format!("{}{}", packet_acc_data, cur_packet_data);
-                            packet_acc_size += cur_packet_data.as_bytes().len();
-
-                            if packet_acc_size == packet_total_size {
-                                println!("[TCP] Data on: {}", session_id);
-
-                                // Add data to responses hashmap
-                                let _ = tx
-                                    .send((packet_request_id, packet_acc_data.to_string()))
-                                    .await;
-
-                                packet_acc_size = 0;
-                                packet_total_size = 0;
-                                packet_acc_data = "".to_string();
-                                packet_request_id = "".to_string();
-                            }
                             continue;
                         }
+                    };
 
-                        let mut packet_split = cur_packet_data.split("\n\n\n");
-                        let packet_header = packet_split.next().unwrap();
-                        let packet_data = packet_split.next().unwrap();
+                    // Packet fragmentation?
+                    if packet_request_id != *"" {
+                        packet_acc_data = format!("{}{}", packet_acc_data, cur_packet_data);
+                        packet_acc_size += cur_packet_data.as_bytes().len();
 
-                        let mut packet_header_split = packet_header.split(":::");
-                        let request_id = packet_header_split.next().unwrap();
-                        let packet_size = packet_header_split.next().unwrap();
-                        let packet_size = packet_size.parse::<usize>().unwrap();
-
-                        // First packet appear, is complete?
-                        if packet_size == packet_data.as_bytes().len() {
-                            println!("[TCP] Data on: {}", session_id);
+                        if packet_acc_size == packet_total_size {
+                            println!("[TCP] Data on: {session_id}");
 
                             // Add data to responses hashmap
                             let _ = tx
-                                .send((request_id.to_string(), packet_data.to_string()))
+                                .send((packet_request_id, packet_acc_data.to_string()))
                                 .await;
-                        } else {
-                            // Packet is not complete
-                            packet_request_id = request_id.to_string();
-                            packet_acc_data = packet_data.to_string();
-                            packet_acc_size = packet_data.as_bytes().len();
-                            packet_total_size = packet_size;
+
+                            packet_acc_size = 0;
+                            packet_total_size = 0;
+                            packet_acc_data = "".to_string();
+                            packet_request_id = "".to_string();
                         }
+                        continue;
                     }
-                    Err(e) => {
-                        // error
-                        eprintln!(
-                            "[TCP] Error on socket connection: {} \n\n {}",
-                            session_id, e
-                        );
-                        break;
+
+                    let mut packet_split = cur_packet_data.split("\n\n\n");
+                    let packet_header = packet_split.next().unwrap();
+                    let packet_data = packet_split.next().unwrap();
+
+                    let mut packet_header_split = packet_header.split(":::");
+                    let request_id = packet_header_split.next().unwrap();
+                    let packet_size = packet_header_split.next().unwrap();
+                    let packet_size = packet_size.parse::<usize>().unwrap();
+
+                    // First packet appear, is complete?
+                    if packet_size == packet_data.as_bytes().len() {
+                        println!("[TCP] Data on: {session_id}");
+
+                        // Add data to responses hashmap
+                        let _ = tx
+                            .send((request_id.to_string(), packet_data.to_string()))
+                            .await;
+                    } else {
+                        // Packet is not complete
+                        packet_request_id = request_id.to_string();
+                        packet_acc_data = packet_data.to_string();
+                        packet_acc_size = packet_data.as_bytes().len();
+                        packet_total_size = packet_size;
                     }
                 }
+                Err(e) => {
+                    // error
+                    eprintln!("[TCP] Error on socket connection: {session_id} \n\n {e}",);
+                    break;
+                }
             }
-            _ => {}
         }
     }
 }
 
-async fn http_server(port: Port, sessions: Sessions) {
+async fn http_server(port: u16, sessions: Sessions) {
     // The address we'll bind to.
-    let addr = ([0, 0, 0, 0], port.num).into();
+    let addr = ([0, 0, 0, 0], port).into();
 
     // This is our service handler. It receives a Request, processes it, and returns a Response.
     let make_service = make_service_fn(|_conn| {
@@ -237,11 +212,11 @@ async fn http_server(port: Port, sessions: Sessions) {
         }
     });
 
-    let server = Server::bind(&addr).serve(make_service);
-    println!("[HTTP] Waiting connections on {}", port.num);
+    //let server = ;
+    println!("[HTTP] Waiting connections on {port}");
 
-    if let Err(e) = server.await {
-        eprintln!("[HTTP] server error: {}", e);
+    if let Err(e) = Server::bind(&addr).serve(make_service).await {
+        eprintln!("[HTTP] server error: {e}");
     }
 }
 
@@ -306,8 +281,7 @@ async fn http_connection_handler(
 
     // body
     let body = hyper::body::to_bytes(_req.into_body()).await;
-    if body.is_ok() {
-        let body = body.unwrap();
+    if let Ok(body) = body {
         if !body.is_empty() {
             request += &format!("\n{}", String::from_utf8(body.to_vec()).unwrap());
         }
@@ -429,9 +403,8 @@ async fn http_connection_handler(
         }
     }
 
-    let response: Response<Body>;
-    if body.is_some() {
-        let _body = body.unwrap().to_string();
+    let response = if let Some(body) = body {
+        let _body = body.to_string();
         let _body = general_purpose::STANDARD.decode(_body);
         let _body = match _body {
             Ok(_body) => match String::from_utf8(_body) {
@@ -457,21 +430,21 @@ async fn http_connection_handler(
             }
         };
         let hyper_body = Body::from(_body);
-        response = response_builder.body(hyper_body).unwrap();
+        response_builder.body(hyper_body).unwrap()
     } else {
-        response = response_builder.body(Body::empty()).unwrap();
-    }
+        response_builder.body(Body::empty()).unwrap()
+    };
 
-    println!("[HTTP] 200 Status on {}", request_path);
+    println!("[HTTP] 200 Status on {request_path}");
     Ok(response)
 }
 
-fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
-    let referer = _req.headers().get("referer");
+fn get_request_url(request: &hyper::Request<Body>) -> (String, String) {
+    let referer = request.headers().get("referer");
 
     // [no referer]
     if referer.is_none() {
-        let mut segments = _req.uri().path().split('/').collect::<Vec<&str>>(); // /abc/paco -> ["", "abc", "paco"]
+        let mut segments = request.uri().path().split('/').collect::<Vec<&str>>(); // /abc/paco -> ["", "abc", "paco"]
         let session_endpoint = segments[1].to_string();
         segments.drain(0..2); // request path
         return (session_endpoint, "/".to_string() + &segments.join("/"));
@@ -484,7 +457,7 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
         .collect::<Vec<String>>();
     referer.drain(0..3); // drop -> "https:" + "" + "localhost:8080"
 
-    let mut url = _req
+    let mut url = request
         .uri()
         .path()
         .split('/')
