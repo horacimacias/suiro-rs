@@ -65,11 +65,8 @@ async fn tcp_server(port: u16, sessions: Sessions) {
     println!("[TCP] Waiting connections on {port}");
 
     loop {
-        let (socket, _) = match listener.accept().await {
-            Ok((socket, addr)) => (socket, addr),
-            Err(_) => {
-                continue;
-            }
+        let Ok((socket, _addr)) = listener.accept().await else {
+            continue;
         };
         let sessions_clone = sessions.clone(); // avoid sessions_ref being moved
 
@@ -221,17 +218,16 @@ async fn http_server(port: u16, sessions: Sessions) {
 }
 
 async fn http_connection_handler(
-    _req: hyper::Request<Body>,
+    req: hyper::Request<Body>,
     sessions: Sessions,
 ) -> Result<Response<Body>, hyper::Error> {
-    let (session_endpoint, agent_request_path) = get_request_url(&_req);
-    let uri = _req.uri().clone();
-    let request_path = uri.path();
-    println!("[HTTP] {}", request_path);
+    let (session_endpoint, agent_request_path) = get_request_url(&req);
+    let request_path = req.uri().path().to_string();
+    println!("[HTTP] {request_path}");
 
     // avoid websocket
-    if _req.headers().contains_key("upgrade") {
-        println!("[HTTP](ws) 403 Status on {}", request_path);
+    if req.headers().contains_key("upgrade") {
+        println!("[HTTP](ws) 403 Status on {request_path}");
         let response = Response::builder()
             .status(404)
             .header("Content-type", "text/html")
@@ -240,7 +236,7 @@ async fn http_connection_handler(
         return Ok(response);
     }
 
-    if request_path.to_string().clone() == *"/" {
+    if request_path == "/" {
         let response = Response::builder()
             .status(200)
             .header("Content-type", "text/html")
@@ -249,16 +245,18 @@ async fn http_connection_handler(
         return Ok(response);
     }
 
-    let mut sessions = sessions.lock().await; // get access to hashmap - very dangerous
-    if !sessions.contains_key(session_endpoint.as_str()) {
-        let response = Response::builder()
-            .status(404)
-            .header("Content-type", "text/html")
-            .body(Body::from("<h1>404 Not found</h1>"))
-            .unwrap();
-        return Ok(response);
-    }
-    let session = sessions.get_mut(session_endpoint.as_str());
+    let (socket_tx, mut responses_rx) = {
+        let mut sessions = sessions.lock().await; // get access to hashmap - very dangerous
+        let Some(session) = sessions.remove(session_endpoint.as_str()) else {
+            let response = Response::builder()
+                .status(404)
+                .header("Content-type", "text/html")
+                .body(Body::from("<h1>404 Not found</h1>"))
+                .unwrap();
+            return Ok(response);
+        };
+        (session.socket_tx.clone(), session.responses_rx)
+    };
 
     // Create raw http from request
     // ----------------------------
@@ -266,13 +264,13 @@ async fn http_connection_handler(
     // headers
     let http_request_info = format!(
         "{} {} {:?}\n",
-        _req.method().as_str(),
+        req.method().as_str(),
         agent_request_path,
-        _req.version()
+        req.version()
     );
     let mut request = request_id.clone() + "\n" + http_request_info.as_str();
 
-    for (key, value) in _req.headers() {
+    for (key, value) in req.headers() {
         match value.to_str() {
             Ok(value) => request += &format!("{}: {}\n", capitilize(key.as_str()), value),
             Err(_) => request += &format!("{}: {:?}\n", capitilize(key.as_str()), value.as_bytes()),
@@ -280,39 +278,22 @@ async fn http_connection_handler(
     }
 
     // body
-    let body = hyper::body::to_bytes(_req.into_body()).await;
+    let body = hyper::body::to_bytes(req.into_body()).await;
     if let Ok(body) = body {
         if !body.is_empty() {
             request += &format!("\n{}", String::from_utf8(body.to_vec()).unwrap());
         }
     }
 
-    let session = match session {
-        Some(session) => session,
-        None => {
-            println!("es aqui");
-            let response = Response::builder()
-                .status(500)
-                .header("Content-type", "text/html")
-                .body(Body::from("<h1>500 Internal server error</h1>"))
-                .unwrap();
-            return Ok(response);
-        }
-    };
-
     // Send raw http to tcp socket
-    let sent = session.socket_tx.send(request).await;
-    match sent {
-        Ok(_) => {}
-        Err(_) => {
-            println!("[HTTP] 500 Status on {}", session_endpoint);
-            let response = Response::builder()
-                .status(500)
-                .header("Content-type", "text/html")
-                .body(Body::from("<h1>500 Internal server error</h1>"))
-                .unwrap();
-            return Ok(response);
-        }
+    if let Err(err) = socket_tx.send(request).await {
+        println!("[HTTP] 500 Status on {}: {err}", session_endpoint);
+        let response = Response::builder()
+            .status(500)
+            .header("Content-type", "text/html")
+            .body(Body::from("<h1>500 Internal server error</h1>"))
+            .unwrap();
+        return Ok(response);
     }
 
     // Wait for response
@@ -321,10 +302,9 @@ async fn http_connection_handler(
     let mut http_raw_response = String::from("");
     loop {
         // Check if response is ready
-        if let Some(agent_response) = session.responses_rx.recv().now_or_never() {
-            let agent_response = agent_response.unwrap();
-            if request_id == agent_response.0 {
-                http_raw_response = agent_response.1;
+        if let Some((agent_response_id, agent_response_body)) = responses_rx.recv().await {
+            if request_id == agent_response_id {
+                http_raw_response = agent_response_body;
                 break;
             }
         }
@@ -349,7 +329,7 @@ async fn http_connection_handler(
 
     // Check integrity of response [Packet fragmentation error]
     if http_raw_response == *"EPACKFRAG" {
-        println!("[HTTP] 500 Status on {}", session_endpoint);
+        println!("[HTTP] 500 Status on {session_endpoint}");
         let response = Response::builder()
             .status(500)
             .header("Content-type", "text/html")
@@ -374,7 +354,7 @@ async fn http_connection_handler(
     let body = http_response["body"].as_str();
 
     if status_code == 0 {
-        println!("[HTTP] 570 Status on {}", session_endpoint);
+        println!("[HTTP] 570 Status on {session_endpoint}");
         let response = Response::builder()
             .status(570)
             .header("Content-type", "text/html")
@@ -384,7 +364,7 @@ async fn http_connection_handler(
     }
 
     if headers.keys().len() < 1 {
-        println!("[HTTP] 570 Status on {}", session_endpoint);
+        println!("[HTTP] 570 Status on {session_endpoint}");
         let response = Response::builder()
             .status(570)
             .header("Content-type", "text/html")
@@ -404,13 +384,12 @@ async fn http_connection_handler(
     }
 
     let response = if let Some(body) = body {
-        let _body = body.to_string();
-        let _body = general_purpose::STANDARD.decode(_body);
-        let _body = match _body {
-            Ok(_body) => match String::from_utf8(_body) {
-                Ok(_body) => _body,
-                Err(_) => {
-                    println!("Error converting body");
+        let body = general_purpose::STANDARD.decode(body);
+        let body = match body {
+            Ok(body) => match String::from_utf8(body) {
+                Ok(body) => body,
+                Err(err) => {
+                    println!("Error converting body: {err}");
                     let response = Response::builder()
                         .status(500)
                         .header("Content-type", "text/html")
@@ -419,8 +398,8 @@ async fn http_connection_handler(
                     return Ok(response);
                 }
             },
-            Err(_) => {
-                println!("Error decoding body");
+            Err(err) => {
+                println!("Error decoding body: {err}");
                 let response = Response::builder()
                     .status(500)
                     .header("Content-type", "text/html")
@@ -429,7 +408,7 @@ async fn http_connection_handler(
                 return Ok(response);
             }
         };
-        let hyper_body = Body::from(_body);
+        let hyper_body = Body::from(body);
         response_builder.body(hyper_body).unwrap()
     } else {
         response_builder.body(Body::empty()).unwrap()
@@ -443,19 +422,17 @@ fn get_request_url(request: &hyper::Request<Body>) -> (String, String) {
     let referer = request.headers().get("referer");
 
     // [no referer]
-    if referer.is_none() {
+    let Some(referer) = referer else {
         let mut segments = request.uri().path().split('/').collect::<Vec<&str>>(); // /abc/paco -> ["", "abc", "paco"]
         let session_endpoint = segments[1].to_string();
         segments.drain(0..2); // request path
         return (session_endpoint, "/".to_string() + &segments.join("/"));
-    }
+    };
 
-    let referer = referer.unwrap().to_str().unwrap(); // https://localhost:8080/abc/paco
-    let mut referer = referer
-        .split('/')
-        .map(|r| r.to_string())
-        .collect::<Vec<String>>();
-    referer.drain(0..3); // drop -> "https:" + "" + "localhost:8080"
+    let referer = referer.to_str().unwrap(); // https://localhost:8080/abc/paco
+    let mut referer = referer.split('/').map(|r| r.to_string());
+
+    let referer = referer.nth(4).unwrap_or_default(); // drop -> "https:" + "" + "localhost:8080"
 
     let mut url = request
         .uri()
@@ -466,18 +443,18 @@ fn get_request_url(request: &hyper::Request<Body>) -> (String, String) {
         .collect::<Vec<String>>();
 
     // [different session-endpoint]
-    if referer[0] != url[0] {
-        return (referer[0].clone(), "/".to_string() + &url.join("/"));
+    if referer != url[0] {
+        return (referer, "/".to_string() + &url.join("/"));
     }
 
     // [same session-endpoint]
     url.drain(0..1);
-    (referer[0].clone(), "/".to_string() + &url.join("/"))
+    (referer, "/".to_string() + &url.join("/"))
 }
 
 fn capitilize(string: &str) -> String {
     let segments = string.split('-');
-    let mut result: Vec<String> = Vec::new();
+    let mut result = Vec::new();
 
     for segment in segments {
         let mut chars = segment.chars();
