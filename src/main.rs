@@ -127,6 +127,7 @@ async fn tcp_connection_handler(mut socket: TcpStream, sessions: Sessions) {
                         Err(_) => {
                             eprintln!("[TCP] EPACKGRAG: Not valid utf8");
                             // Add data to responses hashmap
+                            // TODO: if sending fails is because there is no receiver; this likely means we can even close the tcp connection
                             let _ = tx.send((packet_request_id, "EPACKFRAG".to_string())).await;
 
                             packet_acc_size = 0;
@@ -200,7 +201,7 @@ async fn http_server(port: u16, sessions: Sessions) {
 
     // This is our service handler. It receives a Request, processes it, and returns a Response.
     let make_service = make_service_fn(|_conn| {
-        let sessions_ref = Arc::clone(&sessions);
+        let sessions_ref = sessions.clone();
         async {
             Ok::<_, hyper::Error>(service_fn(move |req| {
                 let sessions_clone = sessions_ref.clone();
@@ -221,6 +222,7 @@ async fn http_connection_handler(
     req: hyper::Request<Body>,
     sessions: Sessions,
 ) -> Result<Response<Body>, hyper::Error> {
+    // TODO: looks like we're having only 1 session per endpoint, are we not expecting browsers to send multiple parallel requests for the same session/endpoint?
     let (session_endpoint, agent_request_path) = get_request_url(&req);
     let request_path = req.uri().path().to_string();
     println!("[HTTP] {request_path}");
@@ -246,7 +248,8 @@ async fn http_connection_handler(
     }
 
     let (socket_tx, mut responses_rx) = {
-        let mut sessions = sessions.lock().await; // get access to hashmap - very dangerous
+        let mut sessions = sessions.lock().await; // get access to hashmap - limit scope to the absolute minimum
+                                                  // TODO: before you were getting (not removing) the session from sessions. Perhaps I'm not fully following the semanthics/ownership here but I think you should be removing the session from the hashmap, otherwise you're not really removing it and you're not allowing (or we're mixing) other requests with the same session
         let Some(session) = sessions.remove(session_endpoint.as_str()) else {
             let response = Response::builder()
                 .status(404)
@@ -302,7 +305,9 @@ async fn http_connection_handler(
     let mut http_raw_response = String::from("");
     loop {
         // Check if response is ready
+        // TODO: look at tokio's timeout function which you can use to await something for a certain amount of time and avoid looping
         if let Some((agent_response_id, agent_response_body)) = responses_rx.recv().await {
+            // TODO: when would request_id not be equal to agent_response_id? this sounds like we may be mixing connections/sessions and also related to concurrent endpoints/session comment above
             if request_id == agent_response_id {
                 http_raw_response = agent_response_body;
                 break;
