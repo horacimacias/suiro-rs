@@ -1,7 +1,7 @@
 use base64::engine::general_purpose;
 use base64::Engine;
 use futures::FutureExt;
-use hyper::server::conn::Http;
+
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Response, Server};
 use serde_json::{Result as SerdeResult, Value};
@@ -10,8 +10,8 @@ use std::error::Error;
 use std::io;
 use std::result::Result;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use tokio::io::{AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::oneshot::Sender;
