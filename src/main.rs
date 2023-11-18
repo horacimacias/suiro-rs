@@ -146,12 +146,7 @@ async fn tcp_server(port: Port, sessions: Sessions) -> io::Result<()> {
         let (socket_tx, socket_rx) = mpsc::channel(100);
         let session = Session::new(session_id.clone(), session_endpoint, socket_tx);
         let session = Arc::new(session);
-        {
-            let mut locked_sessions = sessions.lock().await;
-            if let Some(_old_value) = locked_sessions.insert(session_id.clone(), session.clone()) {
-                println!("duplicated uuid generated!?: {session_id}");
-            };
-        }
+        insert_new_session(&sessions, session_id.clone(), session.clone()).await;
         let task_sessions = sessions.clone();
         tokio::spawn(async move {
             // spawn a task for each inbound socket
@@ -159,9 +154,32 @@ async fn tcp_server(port: Port, sessions: Sessions) -> io::Result<()> {
                 println!("[TCP] Error: {err}");
             }
             // tcp connection loop finished; remove session from sessions otherwise it will be kept forever
-            task_sessions.lock().await.remove(&session_id);
+            remove_session(&task_sessions, session_id).await;
         });
     }
+}
+
+async fn insert_new_session(
+    sessions: &Mutex<HashMap<String, Arc<Session>>>,
+    session_id: String,
+    session: Arc<Session>,
+) {
+    let mut locked_sessions = sessions.lock().await;
+    if let Some(_old_value) = locked_sessions.insert(session_id.clone(), session) {
+        println!("duplicated uuid generated!?: {session_id}");
+    };
+}
+
+async fn get_existing_session(
+    sessions: &Mutex<HashMap<String, Arc<Session>>>,
+    session_endpoint: &String,
+) -> Option<Arc<Session>> {
+    sessions.lock().await.get(session_endpoint).cloned()
+}
+
+async fn remove_session(sessions: &Mutex<HashMap<String, Arc<Session>>>, session_id: String) {
+    let mut locked_sessions = sessions.lock().await;
+    locked_sessions.remove(&session_id);
 }
 
 struct SuiroResponse {
@@ -231,7 +249,7 @@ async fn http_connection_handler(
         return Ok(response);
     }
 
-    let Some(session) = sessions.lock().await.get(&session_endpoint).cloned() else {
+    let Some(session) = get_existing_session(&sessions, &session_endpoint).await else {
         // get access to hashmap - very dangerous
 
         let response = Response::builder()
