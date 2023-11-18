@@ -1,17 +1,20 @@
 use base64::engine::general_purpose;
 use base64::Engine;
-use futures::lock::Mutex;
 use futures::FutureExt;
+use hyper::server::conn::Http;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Response, Server};
 use serde_json::{Result as SerdeResult, Value};
 use std::collections::HashMap;
+use std::error::Error;
+use std::io;
 use std::result::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::oneshot::Sender;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use unique_id::{string::StringGenerator, Generator};
 
 struct Port {
@@ -28,24 +31,85 @@ impl Port {
 }
 
 #[derive(Debug)]
+struct HttpResponse(String);
+#[derive(Debug)]
+struct HttpRequest(String);
+
+type HttpRequestTask = (HttpRequest, Sender<HttpResponse>);
+
+type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
+
 struct Session {
-    socket_tx: mpsc::Sender<String>,
-    responses_rx: mpsc::Receiver<(String, String)>,
+    session_id: String,
+    session_endpoint: String,
+    incoming_requests: mpsc::Sender<HttpRequestTask>,
+}
+
+impl Session {
+    async fn add_request_task(&self, task: HttpRequestTask) -> Result<(), Box<dyn Error>> {
+        self.incoming_requests.send(task).await?;
+        Ok(())
+    }
 }
 
 impl Session {
     fn new(
-        socket_tx: mpsc::Sender<String>,
-        responses_rx: mpsc::Receiver<(String, String)>,
+        session_id: String,
+        session_endpoint: String,
+        incoming_requests: mpsc::Sender<(HttpRequest, Sender<HttpResponse>)>,
     ) -> Self {
         Session {
-            socket_tx,
-            responses_rx,
+            session_id,
+            session_endpoint,
+            incoming_requests,
+        }
+    }
+
+    async fn tcp_connection_handler(
+        &self,
+        mut socket: TcpStream,
+        mut rx: mpsc::Receiver<(HttpRequest, Sender<HttpResponse>)>,
+    ) {
+        let session_id = &self.session_id;
+        let session_endpoint = &self.session_endpoint;
+        println!("[TCP] New connection {session_id}: /{session_endpoint}");
+        socket // write request to the agent socket
+            .write_all(format!("connection\n{session_endpoint}").as_bytes())
+            .await
+            .unwrap(); // handle unwrap...
+        let request_id_generator = StringGenerator;
+        let mut pending_requests = HashMap::new();
+        // TODO: do not loop between receiving data that needs to be sent to socket and receiving from socket that needs to be sent on http handlers; select instead of loop
+        loop {
+            // Write data to socket on request
+            if let Some((request, reply)) = rx.recv().await {
+                let request_id = request_id_generator.next_id();
+                pending_requests.insert(request_id, reply);
+                let raw_request = request.0;
+                socket.write_all(raw_request.as_bytes()).await.unwrap();
+            }
+
+            match read_next_packet(&mut socket).await {
+                Ok(packet) => {
+                    let (request_id, response) = packet.into();
+                    let reply = pending_requests.remove(&request_id);
+                    match reply {
+                        Some(reply) => {
+                            reply.send(response).unwrap();
+                        }
+                        None => {
+                            println!("[TCP] Error: no reply found for request_id {request_id}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[TCP] Error reading packet {e}");
+                    break;
+                }
+            }
         }
     }
 }
-
-type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 
 #[tokio::main]
 async fn main() {
@@ -59,11 +123,13 @@ async fn main() {
     let http_port = Port::new(8080);
     let tcp_port = Port::new(3040);
 
-    let mutex: Mutex<HashMap<String, Session>> = Mutex::new(HashMap::new());
+    let mutex = Mutex::new(HashMap::new());
     let sessions = Arc::new(mutex);
 
     let tcp = async {
-        tcp_server(tcp_port, sessions.clone()).await;
+        tcp_server(tcp_port, sessions.clone())
+            .await
+            .expect("tcp server error");
     };
 
     let http = async {
@@ -73,138 +139,48 @@ async fn main() {
     futures::join!(tcp, http);
 }
 
-async fn tcp_server(port: Port, sessions: Sessions) {
+async fn tcp_server(port: Port, sessions: Sessions) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port.num)).await.unwrap();
     println!("[TCP] Waiting connections on {}", port.num);
-
+    let session_generator = StringGenerator;
+    let session_endpoint_generator = StringGenerator;
     loop {
-        let Ok((socket, _addr)) = listener.accept().await else {
-            continue;
-        };
+        let (socket, _addr) = listener.accept().await?;
 
-        let sessions_clone = sessions.clone();
-        tokio::spawn(async {
+        let session_id = session_generator.next_id();
+        let session_endpoint = session_endpoint_generator.next_id();
+        let (socket_tx, socket_rx) = mpsc::channel(100);
+        let session = Session::new(session_id.clone(), session_endpoint, socket_tx);
+        let session = Arc::new(session);
+        {
+            let mut locked_sessions = sessions.lock().await;
+            if let Some(_old_value) = locked_sessions.insert(session_id.clone(), session.clone()) {
+                println!("duplicated uuid generated!?: {session_id}");
+            };
+        }
+        let task_sessions = sessions.clone();
+        tokio::spawn(async move {
             // spawn a task for each inbound socket
-            tcp_connection_handler(socket, sessions_clone).await;
+            session.tcp_connection_handler(socket, socket_rx).await;
+            // tcp connection loop finished; remove session from sessions otherwise it will be kept forever
+            task_sessions.lock().await.remove(&session_id);
         });
     }
 }
 
-async fn tcp_connection_handler(mut socket: TcpStream, sessions: Sessions) {
-    let session_id = StringGenerator::default().next_id();
-    let session_endpoint = StringGenerator::default().next_id();
+struct SuiroResponse {
+    request_id: String,
+    response: HttpResponse,
+}
 
-    println!("[TCP] New connection {session_id}: /{session_endpoint}");
-    socket // write request to the agent socket
-        .write_all(format!("connection\n{session_endpoint}").as_bytes())
-        .await
-        .unwrap(); // handle unwrap...
-
-    // Add session to hashmap
-    let hashmap_key = session_endpoint.clone();
-    let (socket_tx, mut rx) = mpsc::channel(100); // 100 message queue
-    let (tx, responses_rx) = mpsc::channel(100); // 100 message queue
-    let session = Session::new(socket_tx, responses_rx);
-    {
-        sessions.lock().await.insert(hashmap_key, session); // create a block to avoid infinite lock
+impl From<SuiroResponse> for (String, HttpResponse) {
+    fn from(suiro_response: SuiroResponse) -> (String, HttpResponse) {
+        (suiro_response.request_id, suiro_response.response)
     }
+}
 
-    // Handle incoming data
-    let mut packet_request_id = "".to_string();
-    let mut packet_acc_data = "".to_string();
-    let mut packet_total_size = 0;
-    let mut packet_acc_size = 0;
-
-    let mut buffer = [0; 31250]; // 32 Kb
-    loop {
-        // Write data to socket on request
-        if let Some(Some(request)) = rx.recv().now_or_never() {
-            socket.write_all(request.as_bytes()).await.unwrap();
-        }
-
-        if let Some(sock) = socket.read(&mut buffer).now_or_never() {
-            match sock {
-                Ok(0) => {
-                    // connection closed
-                    println!("[TCP] Connection closed: {}", session_id);
-                    break;
-                }
-                Ok(n) => {
-                    // data received
-                    let data = &buffer[..n];
-
-                    // check packet integrity
-                    let cur_packet_data = String::from_utf8(data.to_vec());
-                    let cur_packet_data = match cur_packet_data {
-                        Ok(cur_packet_data) => cur_packet_data,
-                        Err(_) => {
-                            eprintln!("[TCP] EPACKGRAG: Not valid utf8");
-                            // Add data to responses hashmap
-                            let _ = tx.send((packet_request_id, "EPACKFRAG".to_string())).await;
-
-                            packet_acc_size = 0;
-                            packet_total_size = 0;
-                            packet_acc_data = "".to_string();
-                            packet_request_id = "".to_string();
-
-                            continue;
-                        }
-                    };
-
-                    // Packet fragmentation?
-                    if packet_request_id != "" {
-                        packet_acc_data = format!("{packet_acc_data}{cur_packet_data}");
-                        packet_acc_size = packet_acc_size + cur_packet_data.as_bytes().len();
-
-                        if packet_acc_size == packet_total_size {
-                            println!("[TCP] Data on: {session_id}");
-
-                            // Add data to responses hashmap
-                            let _ = tx
-                                .send((packet_request_id, packet_acc_data.to_string()))
-                                .await;
-
-                            packet_acc_size = 0;
-                            packet_total_size = 0;
-                            packet_acc_data = "".to_string();
-                            packet_request_id = "".to_string();
-                        }
-                        continue;
-                    }
-
-                    let mut packet_split = cur_packet_data.split("\n\n\n");
-                    let packet_header = packet_split.next().unwrap();
-                    let packet_data = packet_split.next().unwrap();
-
-                    let mut packet_header_split = packet_header.split(":::");
-                    let request_id = packet_header_split.next().unwrap();
-                    let packet_size = packet_header_split.next().unwrap();
-                    let packet_size = packet_size.parse::<usize>().unwrap();
-
-                    // First packet appear, is complete?
-                    if packet_size == packet_data.as_bytes().len() {
-                        println!("[TCP] Data on: {session_id}");
-
-                        // Add data to responses hashmap
-                        let _ = tx
-                            .send((request_id.to_string(), packet_data.to_string()))
-                            .await;
-                    } else {
-                        // Packet is not complete
-                        packet_request_id = request_id.to_string();
-                        packet_acc_data = packet_data.to_string();
-                        packet_acc_size = packet_data.as_bytes().len();
-                        packet_total_size = packet_size;
-                    }
-                }
-                Err(_) => {
-                    // error
-                    eprintln!("[TCP] Error on socket connection: {session_id}");
-                    break;
-                }
-            }
-        }
-    }
+async fn read_next_packet(_socket: &mut TcpStream) -> io::Result<SuiroResponse> {
+    todo!()
 }
 
 async fn http_server(port: Port, sessions: Sessions) {
@@ -231,16 +207,16 @@ async fn http_server(port: Port, sessions: Sessions) {
 }
 
 async fn http_connection_handler(
-    _req: hyper::Request<Body>,
+    request: hyper::Request<Body>,
     sessions: Sessions,
 ) -> Result<Response<Body>, hyper::Error> {
-    let (session_endpoint, agent_request_path) = get_request_url(&_req);
-    let uri = _req.uri().clone();
-    let request_path = uri.path().clone();
-    println!("[HTTP] {}", request_path);
+    let (session_endpoint, agent_request_path) = get_request_url(&request);
+    let uri = request.uri().clone();
+    let request_path = uri.path();
+    println!("[HTTP] {request_path}");
 
     // avoid websocket
-    if _req.headers().contains_key("upgrade") {
+    if request.headers().contains_key("upgrade") {
         println!("[HTTP](ws) 403 Status on {}", request_path);
         let response = Response::builder()
             .status(404)
@@ -250,7 +226,7 @@ async fn http_connection_handler(
         return Ok(response);
     }
 
-    if request_path.to_string().clone() == "/".to_string() {
+    if request_path == "/" {
         let response = Response::builder()
             .status(200)
             .header("Content-type", "text/html")
@@ -259,108 +235,33 @@ async fn http_connection_handler(
         return Ok(response);
     }
 
-    let mut sessions = sessions.lock().await; // get access to hashmap - very dangerous
-    if !sessions.contains_key(session_endpoint.as_str()) {
+    let Some(session) = sessions.lock().await.get(&session_endpoint).cloned() else {
+        // get access to hashmap - very dangerous
+
         let response = Response::builder()
             .status(404)
             .header("Content-type", "text/html")
             .body(Body::from("<h1>404 Not found</h1>"))
             .unwrap();
         return Ok(response);
-    }
-    let session = sessions.get_mut(session_endpoint.as_str());
+    };
 
     // Create raw http from request
     // ----------------------------
-    let request_id = StringGenerator::default().next_id();
     // headers
     let http_request_info = format!(
         "{} {} {:?}\n",
-        _req.method().as_str(),
+        request.method().as_str(),
         agent_request_path,
-        _req.version()
+        request.version()
     );
-    let mut request = request_id.clone() + "\n" + http_request_info.as_str();
-
-    for (key, value) in _req.headers() {
-        match value.to_str() {
-            Ok(value) => request += &format!("{}: {}\n", capitilize(key.as_str()), value),
-            Err(_) => request += &format!("{}: {:?}\n", capitilize(key.as_str()), value.as_bytes()),
-        }
-    }
-
-    // body
-    let body = hyper::body::to_bytes(_req.into_body()).await;
-    if body.is_ok() {
-        let body = body.unwrap();
-        if body.len() > 0 {
-            request += &format!("\n{}", String::from_utf8(body.to_vec()).unwrap());
-        }
-    }
-
-    let session = match session {
-        Some(session) => session,
-        None => {
-            println!("es aqui");
-            let response = Response::builder()
-                .status(500)
-                .header("Content-type", "text/html")
-                .body(Body::from("<h1>500 Internal server error</h1>"))
-                .unwrap();
-            return Ok(response);
-        }
-    };
 
     // Send raw http to tcp socket
-    let sent = session.socket_tx.send(request).await;
-    match sent {
-        Ok(_) => {}
-        Err(_) => {
-            println!("[HTTP] 500 Status on {}", session_endpoint);
-            let response = Response::builder()
-                .status(500)
-                .header("Content-type", "text/html")
-                .body(Body::from("<h1>500 Internal server error</h1>"))
-                .unwrap();
-            return Ok(response);
-        }
-    }
-
-    // Wait for response
-    let max_time = 100_000; // 100 seconds
-    let mut time = 0;
-    let mut http_raw_response = String::from("");
-    loop {
-        // Check if response is ready
-        if let Some(agent_response) = session.responses_rx.recv().now_or_never() {
-            let agent_response = agent_response.unwrap();
-            if request_id == agent_response.0 {
-                http_raw_response = agent_response.1;
-                break;
-            }
-        }
-
-        // Check if timeout
-        if time >= max_time {
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        time += 100;
-    }
-
-    if time >= max_time {
-        let response = Response::builder()
-            .status(524)
-            .header("Content-type", "text/html")
-            .body(Body::from("<h1>524 A timeout error ocurred</h1>"))
-            .unwrap();
-        return Ok(response);
-    }
-
-    // Check integrity of response [Packet fragmentation error]
-    if http_raw_response == "EPACKFRAG".to_string() {
-        println!("[HTTP] 500 Status on {}", session_endpoint);
+    let (tx, rx) = oneshot::channel();
+    let http_request = HttpRequest(http_request_info);
+    let task = (http_request, tx);
+    if let Err(err) = session.add_request_task(task).await {
+        println!("Error adding request to session: {err}");
         let response = Response::builder()
             .status(500)
             .header("Content-type", "text/html")
@@ -369,7 +270,18 @@ async fn http_connection_handler(
         return Ok(response);
     }
 
-    let http_response_result: SerdeResult<Value> = serde_json::from_str(http_raw_response.as_str());
+    // Check if response is ready
+    let Ok(http_raw_response) = rx.await else {
+        let response = Response::builder()
+            .status(524)
+            .header("Content-type", "text/html")
+            .body(Body::from("<h1>524 A timeout error ocurred</h1>"))
+            .unwrap();
+        return Ok(response);
+    };
+
+    let http_response = http_raw_response.0;
+    let http_response_result: SerdeResult<Value> = serde_json::from_str(http_response.as_str());
     let http_response = http_response_result.unwrap();
 
     // Build response
@@ -448,15 +360,15 @@ async fn http_connection_handler(
     }
 
     println!("[HTTP] 200 Status on {}", request_path);
-    return Ok(response);
+    Ok(response)
 }
 
 fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
     let referer = _req.headers().get("referer");
 
     // [no referer]
-    if !referer.is_some() {
-        let mut segments = _req.uri().path().split("/").collect::<Vec<&str>>(); // /abc/paco -> ["", "abc", "paco"]
+    if referer.is_none() {
+        let mut segments = _req.uri().path().split('/').collect::<Vec<&str>>(); // /abc/paco -> ["", "abc", "paco"]
         let session_endpoint = segments[1].to_string();
         segments.drain(0..2); // request path
         return (session_endpoint, "/".to_string() + &segments.join("/"));
@@ -464,7 +376,7 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
 
     let referer = referer.unwrap().to_str().unwrap(); // https://localhost:8080/abc/paco
     let mut referer = referer
-        .split("/")
+        .split('/')
         .map(|r| r.to_string())
         .collect::<Vec<String>>();
     referer.drain(0..3); // drop -> "https:" + "" + "localhost:8080"
@@ -472,9 +384,9 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
     let mut url = _req
         .uri()
         .path()
-        .split("/")
+        .split('/')
         .map(|r| r.to_string())
-        .filter(|r| r != "")
+        .filter(|r| !r.is_empty())
         .collect::<Vec<String>>();
 
     // [different session-endpoint]
@@ -484,7 +396,7 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
 
     // [same session-endpoint]
     url.drain(0..1);
-    return (referer[0].clone(), "/".to_string() + &url.join("/"));
+    (referer[0].clone(), "/".to_string() + &url.join("/"))
 }
 
 fn capitilize(string: &str) -> String {
