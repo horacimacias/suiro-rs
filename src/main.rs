@@ -9,10 +9,11 @@ use std::error::Error;
 use std::io;
 use std::result::Result;
 use std::sync::Arc;
+use tokio::net::tcp::OwnedReadHalf;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::select;
+use tokio::spawn;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use unique_id::{string::StringGenerator, Generator};
@@ -68,7 +69,7 @@ impl Session {
     async fn tcp_connection_handler(
         &self,
         mut socket: TcpStream,
-        mut rx: mpsc::Receiver<(HttpRequest, Sender<HttpResponse>)>,
+        mut incoming_requests: mpsc::Receiver<(HttpRequest, Sender<HttpResponse>)>,
     ) -> io::Result<()> {
         let session_id = &self.session_id;
         let session_endpoint = &self.session_endpoint;
@@ -79,24 +80,57 @@ impl Session {
             .unwrap(); // handle unwrap...
         let request_id_generator = StringGenerator;
         let mut pending_requests = HashMap::new();
-        // TODO: do not loop between receiving data that needs to be sent to socket and receiving from socket that needs to be sent on http handlers; select instead of loop
-        loop {
-            select! {
-                task = rx.recv() => {
-                    if let Some((request, reply)) = task {
-                        let request_id = request_id_generator.next_id();
-                        pending_requests.insert(request_id, reply);
-                        let raw_request = request.0;
-                        socket.write_all(raw_request.as_bytes()).await.unwrap();
-                    }
+        let (tx, mut rx) = mpsc::channel(100);
+        enum Task {
+            Request(HttpRequestTask),
+            Packet(SuiroResponse),
+        }
+        let my_tx = tx.clone();
+        let (mut socket_read, mut socket_write) = socket.into_split();
+        spawn(async move {
+            loop {
+                let Some(task) = incoming_requests.recv().await else {
+                    println!("[TCP] Error: no more incoming requests");
+                    return;
+                };
+                if let Err(err) = my_tx.send(Task::Request(task)).await {
+                    println!("[TCP] Error: {err}");
+                    return;
                 }
-                packet = read_next_packet(&mut socket) => {
-                    // if reading a packet resulted in error, return
-                    let packet = packet?;
+            }
+        });
+        spawn(async move {
+            loop {
+                let Ok(packet) = read_next_packet(&mut socket_read).await else {
+                    println!("[TCP] Error: no more incoming packets");
+                    return;
+                };
+                if let Err(err) = tx.send(Task::Packet(packet)).await {
+                    println!("[TCP] Error: {err}");
+                    return;
+                }
+            }
+        });
+        loop {
+            let Some(task) = rx.recv().await else {
+                println!("[TCP] Error: no more tasks");
+                return Ok(());
+            };
+            match task {
+                Task::Request((request, reply)) => {
+                    let request_id = request_id_generator.next_id();
+                    pending_requests.insert(request_id, reply);
+                    let raw_request = request.0;
+                    socket_write
+                        .write_all(raw_request.as_bytes())
+                        .await
+                        .unwrap();
+                }
+                Task::Packet(packet) => {
                     let (request_id, response) = packet.into();
-                    if let Some(reply) = pending_requests.remove(&request_id){
+                    if let Some(reply) = pending_requests.remove(&request_id) {
                         reply.send(response).unwrap();
-                    }else{
+                    } else {
                         println!("[TCP] Error: no reply found for request_id {request_id}");
                     }
                 }
@@ -175,7 +209,7 @@ impl From<SuiroResponse> for (String, HttpResponse) {
     }
 }
 
-async fn read_next_packet(_socket: &mut TcpStream) -> io::Result<SuiroResponse> {
+async fn read_next_packet(_socket: &mut OwnedReadHalf) -> io::Result<SuiroResponse> {
     todo!()
 }
 
