@@ -1,6 +1,5 @@
 use base64::engine::general_purpose;
 use base64::Engine;
-use futures::FutureExt;
 
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Response, Server};
@@ -11,7 +10,7 @@ use std::io;
 use std::result::Result;
 use std::sync::Arc;
 
-use tokio::io::{AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::oneshot::Sender;
@@ -324,12 +323,12 @@ async fn http_connection_handler(
     }
 
     let response: Response<Body>;
-    if body.is_some() {
-        let _body = body.unwrap().to_string();
-        let _body = general_purpose::STANDARD.decode(_body);
-        let _body = match _body {
-            Ok(_body) => match String::from_utf8(_body) {
-                Ok(_body) => _body,
+    if let Some(body) = body {
+        let body = body.to_string();
+        let body = general_purpose::STANDARD.decode(body);
+        let body = match body {
+            Ok(body) => match String::from_utf8(body) {
+                Ok(body) => body,
                 Err(_) => {
                     println!("Error converting body");
                     let response = Response::builder()
@@ -350,7 +349,7 @@ async fn http_connection_handler(
                 return Ok(response);
             }
         };
-        let hyper_body = Body::from(_body);
+        let hyper_body = Body::from(body);
         response = response_builder.body(hyper_body).unwrap();
     } else {
         response = response_builder.body(Body::empty()).unwrap();
