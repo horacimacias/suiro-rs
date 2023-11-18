@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use unique_id::{string::StringGenerator, Generator};
@@ -69,7 +70,7 @@ impl Session {
         &self,
         mut socket: TcpStream,
         mut rx: mpsc::Receiver<(HttpRequest, Sender<HttpResponse>)>,
-    ) {
+    ) -> io::Result<()> {
         let session_id = &self.session_id;
         let session_endpoint = &self.session_endpoint;
         println!("[TCP] New connection {session_id}: /{session_endpoint}");
@@ -81,30 +82,24 @@ impl Session {
         let mut pending_requests = HashMap::new();
         // TODO: do not loop between receiving data that needs to be sent to socket and receiving from socket that needs to be sent on http handlers; select instead of loop
         loop {
-            // Write data to socket on request
-            if let Some((request, reply)) = rx.recv().await {
-                let request_id = request_id_generator.next_id();
-                pending_requests.insert(request_id, reply);
-                let raw_request = request.0;
-                socket.write_all(raw_request.as_bytes()).await.unwrap();
-            }
-
-            match read_next_packet(&mut socket).await {
-                Ok(packet) => {
-                    let (request_id, response) = packet.into();
-                    let reply = pending_requests.remove(&request_id);
-                    match reply {
-                        Some(reply) => {
-                            reply.send(response).unwrap();
-                        }
-                        None => {
-                            println!("[TCP] Error: no reply found for request_id {request_id}");
-                        }
+            select! {
+                task = rx.recv() => {
+                    if let Some((request, reply)) = task {
+                        let request_id = request_id_generator.next_id();
+                        pending_requests.insert(request_id, reply);
+                        let raw_request = request.0;
+                        socket.write_all(raw_request.as_bytes()).await.unwrap();
                     }
                 }
-                Err(e) => {
-                    eprintln!("[TCP] Error reading packet {e}");
-                    break;
+                packet = read_next_packet(&mut socket) => {
+                    // if reading a packet resulted in error, return
+                    let packet = packet?;
+                    let (request_id, response) = packet.into();
+                    if let Some(reply) = pending_requests.remove(&request_id){
+                        reply.send(response).unwrap();
+                    }else{
+                        println!("[TCP] Error: no reply found for request_id {request_id}");
+                    }
                 }
             }
         }
@@ -161,7 +156,9 @@ async fn tcp_server(port: Port, sessions: Sessions) -> io::Result<()> {
         let task_sessions = sessions.clone();
         tokio::spawn(async move {
             // spawn a task for each inbound socket
-            session.tcp_connection_handler(socket, socket_rx).await;
+            if let Err(err) = session.tcp_connection_handler(socket, socket_rx).await {
+                println!("[TCP] Error: {err}");
+            }
             // tcp connection loop finished; remove session from sessions otherwise it will be kept forever
             task_sessions.lock().await.remove(&session_id);
         });
@@ -400,7 +397,7 @@ fn get_request_url(_req: &hyper::Request<Body>) -> (String, String) {
 }
 
 fn capitilize(string: &str) -> String {
-    let segments = string.split("-");
+    let segments = string.split('-');
     let mut result: Vec<String> = Vec::new();
 
     for segment in segments {
